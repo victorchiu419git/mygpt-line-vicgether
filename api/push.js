@@ -2,7 +2,8 @@ export const config = { runtime: 'edge' };
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const OPENAI_TIMEOUT_MS = 18000;
+
+const OPENAI_TIMEOUT_MS = 18000; // 最多等 18 秒
 const MAX_TOKENS = 256;
 const MAX_LEN = 4800;
 
@@ -35,12 +36,16 @@ async function askOpenAI({ system, prompt, model }) {
       const t = await r.text().catch(()=> '');
       throw new Error(`OpenAI API error: ${r.status} ${t}`);
     }
+
     const data = await r.json();
     return data?.choices?.[0]?.message?.content?.trim() || '（沒有產生回覆）';
   } catch (e) {
-    if (e?.name === 'AbortError' || e === 'timeout') return '（系統稍忙，我再想一下，請稍後再試或改問更精準的問題）';
+    if (e?.name === 'AbortError' || e === 'timeout')
+      return '（系統稍忙，我再想一下，請稍後再試或改問更精準的問題）';
     throw e;
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function pushToLine(userId, text) {
@@ -50,29 +55,32 @@ async function pushToLine(userId, text) {
     headers: { 'Authorization': `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  if (!r.ok) throw new Error(`LINE push error: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const t = await r.text().catch(()=> '');
+    throw new Error(`LINE push error: ${r.status} ${t}`);
+  }
 }
 
 export default async function handler(req) {
   try {
     if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
-    // ✅ X-Auth 驗證（大小寫皆可）
+    // ✅ 簡單安全驗證：必須帶正確的 X-Auth
     const key = req.headers.get('X-Auth') || req.headers.get('x-auth') || '';
     if (!process.env.PUSH_SECRET || key !== process.env.PUSH_SECRET) {
-      // 不回真實原因，避免洩露
       return new Response('Unauthorized', { status: 401 });
     }
 
     const { userId, prompt, system, model } = await req.json().catch(() => ({}));
     if (!userId || !prompt) return new Response('Bad Request', { status: 400 });
 
-    const answer = await askOpenAI({ system, prompt, model });
+    const answer = await askOpenAI({ system, prompt, model: model || 'gpt-4o-mini' });
     await pushToLine(userId, answer);
 
     return new Response('OK', { status: 200 });
   } catch (e) {
-    console.error('Push handler error:', e);
+    console.error('push error:', e);
+    // 為避免 LINE 重送雪崩，仍回 200
     return new Response('OK', { status: 200 });
   }
 }
