@@ -1,11 +1,9 @@
-import { waitUntil } from '@vercel/functions';
-
 export const config = { runtime: 'edge' };
 
 // ===== Line config =====
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const MAX_LEN = 4800;
-const REPLY_TIMEOUT_MS = 6000; // 回覆最長等 6 秒（仍遠小於 25s）
+const REPLY_TIMEOUT_MS = 6000; // 單次回覆最多等 6 秒（遠小於 25s）
 
 function cut(t, n = MAX_LEN) { return t && t.length > n ? t.slice(0, n) : (t || ''); }
 
@@ -64,12 +62,12 @@ export default async function handler(req) {
         const replyToken = ev.replyToken;
         const debug = { mode, userIdTail: userId.slice(-6) };
 
-        // ✅ 用 Vercel 官方 waitUntil，在回 200 之後背景執行回覆
-        waitUntil(replyToLine(replyToken, '已收到，我正在處理，稍後提供完整答案。', debug));
+        // 同步回覆一句（≤6s），然後立刻回 200
+        await replyToLine(replyToken, '已收到，我正在處理，稍後提供完整答案。', debug);
       }
     }
 
-    // ✅ 立刻回 200，絕不等待外部呼叫
+    // ✅ 立刻回 200，避免 LINE 重送
     return new Response('OK', { status: 200 });
   } catch (e) {
     console.error('WEBHOOK_ERR', e?.message || e);
