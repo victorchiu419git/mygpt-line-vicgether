@@ -12,7 +12,7 @@ const VENDOR_URL   = (process.env.VENDOR_WEBHOOK || '').trim();
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  '你是「VicGether Tech. 亦啟科技 / POWAH」的 LINE 官方ai客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
+  '你是「VicGether Tech. / 亦啟科技 / POWAH」的 LINE 官方ai客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
 
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'service@vicgether.com';
 const SNOOZE_MIN = parseInt(process.env.HUMAN_SNOOZE_MIN || '15', 10);
@@ -56,6 +56,11 @@ function isHumanResumeIntent(t='') {
 function isLowInfoText(t='') {
   const meaningful = (t.match(/[A-Za-z0-9\u4e00-\u9fff]/g) || []).length;
   return meaningful < 2;
+}
+// ★遺漏補上：是否在轉人工冷卻期間
+function isSnoozed(userId='') {
+  const until = snooze.get(userId) || 0;
+  return Date.now() < until;
 }
 
 // ---- LINE Reply（單則）----
@@ -120,7 +125,9 @@ async function forwardToVendorWebhook(rawBody) {
     return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 500) };
   } catch (e) {
     return { ok:false, reason: e?.name || String(e) };
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---- OpenAI（5s）----
@@ -132,7 +139,7 @@ async function askOpenAI(userText) {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       signal: controller.signal,
-      headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}', 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OPENAI_MODEL,
         temperature: 0.2,
@@ -209,7 +216,7 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 1.1) 低資訊文字：改走固定提示（避免讓 AI 回「結論｜重點」）
+        // 1.1) 低資訊文字：固定提示
         if (isLowInfoText(userText)) {
           await replyToLine(
             replyToken,
@@ -223,6 +230,7 @@ export default async function handler(req, res) {
         if (isOrderIntent(userText)) {
           const fwd = await forwardToVendorWebhook(raw);
           console.log('FORWARD_VENDOR', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
+
           if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
             await replyToLine(
               replyToken,
@@ -261,7 +269,7 @@ export default async function handler(req, res) {
 - 產品諮詢/安裝相容 → 輸入【產品諮詢】
 - 要真人協助 → 輸入【人工】
 需要附檔或詳述，也可寄至【${SUPPORT_EMAIL}】。
-還需要我幫你別的嗎？`
+請問還需要我幫忙的地方嗎？`
         };
         const msg2 = {
           type: 'text',
