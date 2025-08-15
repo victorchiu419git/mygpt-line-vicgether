@@ -1,138 +1,85 @@
 export const config = { runtime: 'edge' };
 
-// === 可調參數 ===
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || '你是官方 LINE 客服助理，繁中、條列、精準。';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const SYSTEM_PROMPT =
-  process.env.SYSTEM_PROMPT ||
-  '你是官方 LINE 客服助理，請用繁體中文，條列、精準、短句。不確定時請先釐清。';
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const MAX_LINE = 4800;
 
-// **關鍵**：將 OpenAI 等待時間壓到 9 秒，留足夠時間給 LINE 回覆與收尾
-const OPENAI_TIMEOUT_MS = 9000;
-const MAX_TOKENS = 200;
-const MAX_LINE_LEN = 4800;
-
-// 截斷，避免超過 LINE 字數限制
-function cut(text, n = MAX_LINE_LEN) {
-  if (!text) return '';
-  return text.length > n ? text.slice(0, n) : text;
-}
-
-// 呼叫 OpenAI，9 秒逾時
-async function askOpenAI(content) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort('timeout'), OPENAI_TIMEOUT_MS);
-  try {
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      signal: ctrl.signal,
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        temperature: 0.3,
-        max_tokens: MAX_TOKENS,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: content }
-        ]
-      })
-    });
-
-    if (resp.status === 429) {
-      // 額度不足或速率限制（回代碼給上層）
-      let code = '';
-      try { code = (await resp.json())?.error?.code || ''; } catch {}
-      return code === 'insufficient_quota' ? '__QUOTA__' : '__RATE__';
-    }
-    if (!resp.ok) {
-      const t = await resp.text().catch(()=> '');
-      throw new Error(`OpenAI API error: ${resp.status} ${t}`);
-    }
-
-    const data = await resp.json();
-    const text = data?.choices?.[0]?.message?.content?.trim();
-    return text || '（沒有產生回覆）';
-  } catch (e) {
-    if (e?.name === 'AbortError' || e === 'timeout') return '__TIMEOUT__';
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// 回覆 LINE（replyToken 只能用一次）
+// 短訊（先回覆，保證 < 2s）
 async function replyToLine(replyToken, text) {
-  const payload = { replyToken, messages: [{ type: 'text', text: cut(text) }] };
+  const payload = { replyToken, messages: [{ type: 'text', text: text.slice(0, MAX_LINE) }] };
   const r = await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${LINE_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Authorization': `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  if (!r.ok) {
-    const t = await r.text().catch(()=> '');
-    throw new Error(`LINE reply error: ${r.status} ${t}`);
-  }
+  if (!r.ok) throw new Error(`LINE reply error: ${r.status} ${await r.text()}`);
 }
 
 export default async function handler(req) {
   try {
-    // 健康檢查 / Verify
     if (req.method === 'GET') return new Response('OK', { status: 200 });
     if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
     const body = await req.json().catch(() => ({}));
 
-    // Verify 送空 events → 立刻回 200
+    // Verify / 健康檢查：events 空 → 立即 200
     if (Array.isArray(body?.events) && body.events.length === 0) {
       return new Response('OK', { status: 200 });
     }
 
-    const ev = Array.isArray(body?.events) ? body.events[0] : null; // 只處理第一個事件，降低耗時
+    const ev = Array.isArray(body?.events) ? body.events[0] : null;
     if (!ev) return new Response('OK', { status: 200 });
 
-    try {
-      if (ev.type === 'message' && ev.message?.type === 'text') {
-        const q = (ev.message.text || '').trim();
-        const ans = await askOpenAI(q);
+    // 只處理文字訊息
+    if (ev.type === 'message' && ev.message?.type === 'text') {
+      const userText = (ev.message.text || '').trim();
+      const replyToken = ev.replyToken;
+      const userId = ev.source?.userId || null;
 
-        if (ans === '__TIMEOUT__') {
-          await replyToLine(ev.replyToken, '系統目前較忙，請稍後再試或改問更精準的問題～');
-        } else if (ans === '__QUOTA__') {
-          await replyToLine(ev.replyToken, 'AI 服務額度不足或尚未開通付款，稍後再試或轉人工協助。');
-        } else if (ans === '__RATE__') {
-          await replyToLine(ev.replyToken, '目前請求較多，請稍候幾秒再試。');
-        } else {
-          await replyToLine(ev.replyToken, ans);
-        }
-
-      } else if (ev.type === 'message') {
-        await replyToLine(ev.replyToken, '目前僅支援文字訊息喔。');
-
-      } else if (ev.type === 'follow') {
-        await replyToLine(ev.replyToken, '感謝加入！直接輸入您的問題，我會盡力協助。');
-
-      } else if (ev.type === 'join') {
-        await replyToLine(ev.replyToken, '大家好～我可以協助回答常見問題！');
+      // ① 先回一則「我在處理」
+      try {
+        await replyToLine(replyToken, '我來幫你查，約 5–10 秒後給完整答案👌');
+      } catch (e) {
+        console.error('reply first message failed:', e);
       }
-    } catch (e) {
-      console.error('Event error:', e);
-      // 即使內部失敗，也回使用者一段話，避免沉默
-      try { await replyToLine(ev.replyToken, '抱歉，系統暫時忙碌，請稍後再試。'); } catch (_) {}
+
+      // ② 立刻呼叫自己的 /api/push（不要 await，避免拖時間）
+      try {
+        const origin = new URL(req.url).origin;
+        await fetch(`${origin}/api/push`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Auth': process.env.PUSH_SECRET || ''
+          },
+          body: JSON.stringify({
+            userId,
+            prompt: userText,
+            system: SYSTEM_PROMPT,
+            model: OPENAI_MODEL
+          })
+        });
+      } catch (e) {
+        console.error('trigger push failed:', e);
+      }
+
+      // ③ 立刻回 200（關鍵）
+      return new Response('OK', { status: 200 });
     }
 
-    // **關鍵**：不論如何都在 25 秒內回 200
-    return new Response('OK', { status: 200 });
+    // 非文字：回一則說明
+    if (ev.type === 'message') {
+      try { await replyToLine(ev.replyToken, '目前僅支援文字訊息喔。'); } catch {}
+    } else if (ev.type === 'follow') {
+      try { await replyToLine(ev.replyToken, '感謝加入！直接輸入您的問題，我會盡力協助。'); } catch {}
+    } else if (ev.type === 'join') {
+      try { await replyToLine(ev.replyToken, '大家好～我可以協助回答常見問題！'); } catch {}
+    }
 
+    return new Response('OK', { status: 200 });
   } catch (e) {
     console.error('Handler error:', e);
-    // 即使發生錯誤也回 200，避免 LINE 重送造成雪崩
     return new Response('OK', { status: 200 });
   }
 }
