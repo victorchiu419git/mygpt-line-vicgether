@@ -1,7 +1,5 @@
-export const config = { runtime: 'edge' };
-
-export default async function handler() {
-  return new Response(JSON.stringify({ ok: true, ts: Date.now() }), {
-    status: 200, headers: { 'content-type': 'application/json' }
-  });
+// api/now.js
+export const config = { runtime: 'nodejs18.x' };
+export default async function handler(req, res) {
+  res.status(200).json({ ok: true, ts: Date.now(), env: process.env.VERCEL_ENV || 'unknown' });
 }
