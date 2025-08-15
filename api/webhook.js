@@ -1,4 +1,4 @@
-// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞 + 非文字/低資訊處理 + 逾時保護
+// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞(新版) + 非文字/低資訊處理 + 逾時保護
 // 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
 // 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1
@@ -57,7 +57,7 @@ function isLowInfoText(t='') {
   const meaningful = (t.match(/[A-Za-z0-9\u4e00-\u9fff]/g) || []).length;
   return meaningful < 2;
 }
-// ★遺漏補上：是否在轉人工冷卻期間
+// 是否在轉人工冷卻期間
 function isSnoozed(userId='') {
   const until = snooze.get(userId) || 0;
   return Date.now() < until;
@@ -139,7 +139,7 @@ async function askOpenAI(userText) {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       signal: controller.signal,
-      headers: { 'Authorization': `Bearer ${OPENAI_KEY}', 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OPENAI_MODEL,
         temperature: 0.2,
@@ -257,7 +257,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
       }
 
-      // ---- 加好友（follow）：歡迎詞 + Quick Reply ----
+      // ---- 加好友（follow）：歡迎詞 + Quick Reply（新版文案）----
       if (ev.type === 'follow') {
         const msg1 = {
           type: 'text',
@@ -269,7 +269,7 @@ export default async function handler(req, res) {
 - 產品諮詢/安裝相容 → 輸入【產品諮詢】
 - 要真人協助 → 輸入【人工】
 需要附檔或詳述，也可寄至【${SUPPORT_EMAIL}】。
-請問還需要我幫忙的地方嗎？`
+請問還有什麼地方需要我幫忙的嗎？`
         };
         const msg2 = {
           type: 'text',
