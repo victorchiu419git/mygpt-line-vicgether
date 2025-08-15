@@ -1,9 +1,0 @@
-{
-  "framework": null,
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs",
-      "regions": ["hnd1"]
-    }
-  }
-}
