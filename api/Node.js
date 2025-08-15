@@ -1,13 +1,25 @@
-export const config = { runtime: 'edge' };
+export const config = { runtime: 'nodejs18.x', regions: ['hnd1'] }; // Tokyo
 
-// ===== LINE 回覆設定 =====
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const MAX_LEN = 4800;
-const REPLY_TIMEOUT_MS = 12000; // 單次回覆最多等 12 秒（仍遠小於 25s）
+const REPLY_TIMEOUT_MS = 12000;
 
 function cut(t, n = MAX_LEN) { return t && t.length > n ? t.slice(0, n) : (t || ''); }
 
-// 呼叫 LINE Reply API，並把狀態寫入 Logs（OK / FAIL / ERR）
+// 讀取原始請求內容（Node 版）
+function readRaw(req) {
+  return new Promise((resolve) => {
+    try {
+      let data = '';
+      req.on('data', (c) => (data += c));
+      req.on('end', () => resolve(data));
+      req.on('error', () => resolve(''));
+    } catch {
+      resolve('');
+    }
+  });
+}
+
 async function replyToLine(replyToken, text, debug = {}) {
   if (!replyToken) { console.error('REPLY_SKIP: missing replyToken', debug); return; }
   if (!LINE_TOKEN) { console.error('REPLY_SKIP: missing LINE_CHANNEL_ACCESS_TOKEN', debug); return; }
@@ -16,7 +28,7 @@ async function replyToLine(replyToken, text, debug = {}) {
   const timer = setTimeout(() => ctrl.abort('timeout'), REPLY_TIMEOUT_MS);
 
   try {
-    const res = await fetch('https://api.line.me/v2/bot/message/reply', {
+    const r = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
       signal: ctrl.signal,
       headers: {
@@ -28,10 +40,9 @@ async function replyToLine(replyToken, text, debug = {}) {
         messages: [{ type: 'text', text: cut('已收到，我正在處理，稍後提供完整答案。') }]
       })
     });
-
-    const body = await res.text().catch(() => '');
-    if (!res.ok) console.error('REPLY_FAIL', { status: res.status, body, debug });
-    else console.log('REPLY_OK', { status: res.status, debug });
+    const body = await r.text().catch(() => '');
+    if (!r.ok) console.error('REPLY_FAIL', { status: r.status, body, debug });
+    else console.log('REPLY_OK', { status: r.status, debug });
   } catch (e) {
     console.error('REPLY_ERR', { error: e?.name || String(e), debug });
   } finally {
@@ -39,13 +50,14 @@ async function replyToLine(replyToken, text, debug = {}) {
   }
 }
 
-export default async function handler(req) {
+export default async function handler(req, res) {
   try {
-    if (req.method === 'GET') return new Response('OK', { status: 200 });
-    if (req.method !== 'POST') return new Response('OK', { status: 200 });
+    if (req.method === 'GET') return res.status(200).send('OK');
 
-    // 用 text() 讀原始字串，比 json() 更耐壞
-    const raw = await req.text().catch(() => '');
+    // 只接受 POST，但也回 200 避免 LINE 重送雪崩
+    if (req.method !== 'POST') return res.status(200).send('OK');
+
+    const raw = await readRaw(req);
     let body = {};
     try { body = raw ? JSON.parse(raw) : {}; } catch {}
 
@@ -62,10 +74,10 @@ export default async function handler(req) {
       }
     }
 
-    // ✅ 總是回 200，避免 LINE 重送
-    return new Response('OK', { status: 200 });
+    // ✅ 一律回 200
+    return res.status(200).send('OK');
   } catch (e) {
     console.error('WEBHOOK_ERR', e?.message || e);
-    return new Response('OK', { status: 200 });
+    return res.status(200).send('OK');
   }
 }
