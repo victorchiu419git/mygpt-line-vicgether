@@ -1,3 +1,5 @@
+import { waitUntil } from '@vercel/functions';
+
 export const config = { runtime: 'edge' };
 
 // ===== Line config =====
@@ -39,7 +41,7 @@ async function replyToLine(replyToken, text, debug = {}) {
   }
 }
 
-export default async function handler(req, ctx) {
+export default async function handler(req) {
   try {
     // 健康檢查 / Verify
     if (req.method === 'GET') return new Response('OK', { status: 200 });
@@ -62,8 +64,8 @@ export default async function handler(req, ctx) {
         const replyToken = ev.replyToken;
         const debug = { mode, userIdTail: userId.slice(-6) };
 
-        // 不等待回覆；排到背景執行，webhook 立即回 200
-        ctx?.waitUntil?.(replyToLine(replyToken, '已收到，我正在處理，稍後提供完整答案。', debug));
+        // ✅ 用 Vercel 官方 waitUntil，在回 200 之後背景執行回覆
+        waitUntil(replyToLine(replyToken, '已收到，我正在處理，稍後提供完整答案。', debug));
       }
     }
 
