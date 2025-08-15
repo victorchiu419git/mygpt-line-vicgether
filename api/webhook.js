@@ -1,8 +1,9 @@
-// api/webhook.js — 總控路由 + 轉人工冷卻
-// 需要（Production 環境變數）：
+// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞 + 逾時保護
+// 需要（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
-// 可選：OPENAI_MODEL, SYSTEM_PROMPT, FORWARD_FALLBACK_ON_ERROR=1, HUMAN_SNOOZE_MIN=15
+// 可選：OPENAI_MODEL, SYSTEM_PROMPT, FORWARD_FALLBACK_ON_ERROR=1, HUMAN_SNOOZE_MIN=15, SUPPORT_EMAIL
 
+// ---- 環境變數 ----
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
 const LINE_TOKEN   = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_SECRET  = process.env.LINE_CHANNEL_SECRET;
@@ -11,19 +12,19 @@ const VENDOR_URL   = (process.env.VENDOR_WEBHOOK || '').trim();
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  '你是「VicGether 亦啟科技 / POWAH」的 LINE 客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
+  '你是「VicGether 亦啟科技 / POWAH」的 LINE 官方客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
 
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'service@vicgether.com';
 const FORWARD_FALLBACK_ON_ERROR = (process.env.FORWARD_FALLBACK_ON_ERROR || '') === '1';
 const SNOOZE_MIN = parseInt(process.env.HUMAN_SNOOZE_MIN || '15', 10);
 
+// ---- 參數與工具 ----
 const MAX_LEN = 4800;
 const AI_TIMEOUT_MS     = 5000;  // 5s 取 AI
 const REPLY_TIMEOUT_MS  = 4000;  // 4s 回 LINE
 const VENDOR_TIMEOUT_MS = 6000;  // 6s 轉發外包
 
-// 轉人工：記憶目前實例的使用者冷卻（如需跨實例，之後可換 Redis/KV）
-const snooze = new Map();
-
+const snooze = new Map(); // 轉人工冷卻（若要跨實例，之後可換 Redis/KV）
 const cut = (t, n = MAX_LEN) => (t && t.length > n ? t.slice(0, n) : (t || ''));
 
 // 讀原始 POST body（Node）
@@ -40,90 +41,30 @@ function readRaw(req) {
 
 // ---- 意圖判斷 ----
 function isOrderIntent(text = '') {
-  const t = text.trim();
+  const t = (text || '').trim();
   if (!t) return false;
   const kw = /(查(詢)?訂單|訂單|出貨|物流|配送|進度|order)/i;
   const id = /(#\d{4,}|(?:20)?\d{6,}|PO[-\w]{4,})/i;
   return kw.test(t) || id.test(t);
 }
 function isHumanIntent(t='') {
-  return /(人工|真人|客服|接線|人員協助|找人)/i.test(t);
+  return /(人工|真人|客服|接線|人員協助|找人)/i.test(t || '');
 }
 function isHumanResumeIntent(t='') {
-  return /(解除|取消|恢復).*(人工|機器人|自動|AI)/i.test(t);
+  return /(解除|取消|恢復).*(人工|機器|自動|AI)/i.test(t || '');
 }
 function isSnoozed(userId='') {
   const until = snooze.get(userId) || 0;
   return Date.now() < until;
 }
 
-// ---- 代簽並轉發到外包 Webhook ----
-async function forwardToVendorWebhook(rawBody) {
-  if (!VENDOR_URL || !LINE_SECRET) return { ok:false, reason:'missing vendor or secret' };
-  const { createHmac } = await import('crypto');
-  const signature = createHmac('sha256', LINE_SECRET).update(rawBody).digest('base64');
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('timeout'), VENDOR_TIMEOUT_MS);
-  try {
-    const r = await fetch(VENDOR_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Line-Signature': signature
-      },
-      body: rawBody
-    });
-    const txt = await r.text().catch(()=> '');
-    return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 500) };
-  } catch (e) {
-    return { ok:false, reason: e?.name || String(e) };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ---- OpenAI（5s）----
-async function askOpenAI(userText) {
-  if (!OPENAI_KEY) return '（AI 金鑰未設定，請稍後再試或轉人工）';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('timeout'), AI_TIMEOUT_MS);
-  try {
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        temperature: 0.2,
-        max_tokens: 300,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userText }
-        ]
-      })
-    });
-    if (r.status === 429) {
-      let code=''; try { code=(await r.json())?.error?.code || ''; } catch {}
-      return code==='insufficient_quota'
-        ? '（AI 服務額度不足或未完成付款設定，請稍後再試或改由人工協助）'
-        : '（目前請求較多，請稍候幾秒再試）';
-    }
-    if (!r.ok) return `（AI 服務暫時無法使用：${r.status}）`;
-    const data = await r.json();
-    return data?.choices?.[0]?.message?.content?.trim() || '（沒有產生可用回覆）';
-  } catch (e) {
-    if (e?.name === 'AbortError') return '（系統稍忙，我再想一下，請稍後再試或改問更精準的問題）';
-    return '（系統暫時發生問題，請稍後再試）';
-  } finally { clearTimeout(timer); }
-}
-
-// ---- 回 LINE（4s）----
+// ---- LINE Reply（單則）----
 async function replyToLine(replyToken, text, debug = {}) {
   if (!replyToken || !LINE_TOKEN) return;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
+
   try {
     const r = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -139,7 +80,96 @@ async function replyToLine(replyToken, text, debug = {}) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- 入口 ----
+// ---- LINE Reply（多則，含 quickReply 用）----
+async function replyMessages(replyToken, messages, debug = {}) {
+  if (!replyToken || !LINE_TOKEN) return;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
+
+  try {
+    const r = await fetch('https://api.line.me/v2/bot/message/reply', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Authorization': `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ replyToken, messages })
+    });
+    const body = await r.text().catch(()=> '');
+    if (!r.ok) console.error('REPLY_FAIL', { status: r.status, body, debug });
+    else console.log('REPLY_OK', { status: r.status, debug });
+  } catch (e) {
+    console.error('REPLY_ERR', { error: e?.name || String(e), debug });
+  } finally { clearTimeout(timer); }
+}
+
+// ---- 代簽並轉發到外包 Webhook（原封不動送過去）----
+async function forwardToVendorWebhook(rawBody) {
+  if (!VENDOR_URL || !LINE_SECRET) return { ok:false, reason:'missing vendor or secret' };
+
+  const { createHmac } = await import('crypto');
+  const signature = createHmac('sha256', LINE_SECRET).update(rawBody).digest('base64');
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), VENDOR_TIMEOUT_MS);
+
+  try {
+    const r = await fetch(VENDOR_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Line-Signature': signature
+      },
+      body: rawBody
+    });
+    const txt = await r.text().catch(()=> '');
+    return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 500) };
+  } catch (e) {
+    return { ok:false, reason: e?.name || String(e) };
+  } finally { clearTimeout(timer); }
+}
+
+// ---- OpenAI（5s）----
+async function askOpenAI(userText) {
+  if (!OPENAI_KEY) return '（AI 金鑰未設定，請稍後再試或轉人工）';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), AI_TIMEOUT_MS);
+
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.2,
+        max_tokens: 300,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userText }
+        ]
+      })
+    });
+
+    if (r.status === 429) {
+      let code=''; try { code=(await r.json())?.error?.code || ''; } catch {}
+      return code==='insufficient_quota'
+        ? '（AI 服務額度不足或未完成付款設定，請稍後再試或改由人工協助）'
+        : '（目前請求較多，請稍候幾秒再試）';
+    }
+
+    if (!r.ok) return `（AI 服務暫時無法使用：${r.status}）`;
+
+    const data = await r.json();
+    return data?.choices?.[0]?.message?.content?.trim() || '（沒有產生可用回覆）';
+  } catch (e) {
+    if (e?.name === 'AbortError') return '（系統稍忙，我再想一下，請稍後再試或改問更精準的問題）';
+    return '（系統暫時發生問題，請稍後再試）';
+  } finally { clearTimeout(timer); }
+}
+
+// ---- 入口處理 ----
 export default async function handler(req, res) {
   try {
     if (req.method !== 'POST') return res.status(200).send('OK');
@@ -148,62 +178,111 @@ export default async function handler(req, res) {
     let body = {}; try { body = raw ? JSON.parse(raw) : {}; } catch {}
     const ev = Array.isArray(body?.events) ? body.events[0] : null;
 
-    if (ev?.type === 'message' && ev.message?.type === 'text') {
-      const replyToken = ev.replyToken;
-      const userText   = (ev.message.text || '').trim();
-      const mode       = ev.mode || '(unknown)';
-      const userId     = ev.source?.userId || '(none)';
-      const debugBase  = { mode, userIdTail: userId.slice(-6) };
+    if (ev) {
+      const mode = ev.mode || '(unknown)';
+      const userId = ev.source?.userId || '(none)';
+      console.log('EVENT_MODE', {
+        mode,
+        userIdTail: userId.slice(-6),
+        hasKey: !!OPENAI_KEY,
+        hasLine: !!LINE_TOKEN,
+        hasSecret: !!LINE_SECRET,
+        hasVendor: !!VENDOR_URL
+      });
 
-      // 0) 轉人工指令 → 設冷卻
-      if (isHumanIntent(userText)) {
-        snooze.set(userId, Date.now() + SNOOZE_MIN * 60 * 1000);
+      // ---- 文字訊息 ----
+      if (ev.type === 'message' && ev.message?.type === 'text') {
+        const replyToken = ev.replyToken;
+        const userText   = (ev.message.text || '').trim();
+        const debugBase  = { mode, userIdTail: userId.slice(-6) };
+
+        // 0) 轉人工：設冷卻
+        if (isHumanIntent(userText)) {
+          snooze.set(userId, Date.now() + SNOOZE_MIN * 60 * 1000);
+          await replyToLine(
+            replyToken,
+            `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。\n您可以直接在此輸入問題；若需附檔，亦可寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
+            { ...debugBase, route:'human-on' }
+          );
+          return res.status(200).send('OK');
+        }
+
+        // 0.1) 解除人工：清冷卻
+        if (isHumanResumeIntent(userText)) {
+          snooze.delete(userId);
+          await replyToLine(replyToken, '已結束人工模式，恢復機器回覆。', { ...debugBase, route:'human-off' });
+          return res.status(200).send('OK');
+        }
+
+        // 1) 冷卻期間：不回覆（留給業務）
+        if (isSnoozed(userId)) {
+          console.log('HUMAN_SNOOZED', debugBase);
+          return res.status(200).send('OK');
+        }
+
+        // 2) 查訂單：代簽名轉發給外包（由外包用 replyToken 回覆）
+        if (isOrderIntent(userText)) {
+          const fwd = await forwardToVendorWebhook(raw);
+          console.log('FORWARD_VENDOR', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
+
+          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
+            await replyToLine(
+              replyToken,
+              `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
+              { ...debugBase, route:'vendor-fallback' }
+            );
+          }
+          // 成功時由外包回覆；這裡不再多回
+          return res.status(200).send('OK');
+        }
+
+        // 3) 其他：AI 回覆
+        const ans = await askOpenAI(userText);
+        await replyToLine(replyToken, ans, { ...debugBase, route:'ai' });
+        return res.status(200).send('OK');
+      }
+
+      // ---- 非文字訊息 ----
+      if (ev.type === 'message') {
         await replyToLine(
-          replyToken,
-          `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。您可以直接在此輸入問題，稍後由專員回覆。`,
-          { ...debugBase, route:'human-on' }
+          ev.replyToken,
+          `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
+          { route:'non-text', userIdTail: (ev.source?.userId || '').slice(-6) }
         );
         return res.status(200).send('OK');
       }
 
-      // 0.1) 解除人工 → 清冷卻
-      if (isHumanResumeIntent(userText)) {
-        snooze.delete(userId);
-        await replyToLine(replyToken, '已結束人工模式，恢復機器回覆。', { ...debugBase, route:'human-off' });
+      // ---- 加好友（follow）：歡迎詞 + Quick Reply ----
+      if (ev.type === 'follow') {
+        const msg1 = {
+          type: 'text',
+          text:
+`歡迎加入【VicGether｜POWAH】官方帳號！🎉
+這裡會不定期分享你不想錯過的【最新消息】與【小技巧】。
+想開始：
+- 查配送/進度 → 輸入【查訂單】（附【訂單編號】或【電話後四碼】更快）
+- 產品諮詢/安裝相容 → 輸入【產品諮詢】
+- 要真人協助 → 輸入【人工】
+需要附檔或詳述，也可寄至【${SUPPORT_EMAIL}】。
+還需要我幫你別的嗎？`
+        };
+        const msg2 = {
+          type: 'text',
+          text: '可以用下方快速按鈕開始：',
+          quickReply: {
+            items: [
+              { type: 'action', action: { type: 'message', label: '查訂單',   text: '查訂單' } },
+              { type: 'action', action: { type: 'message', label: '產品諮詢', text: '產品諮詢' } },
+              { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } }
+            ]
+          }
+        };
+        await replyMessages(ev.replyToken, [msg1, msg2], { route:'follow' });
         return res.status(200).send('OK');
       }
-
-      // 1) 冷卻期間 → 不回覆（留給業務）
-      if (isSnoozed(userId)) {
-        console.log('HUMAN_SNOOZED', debugBase);
-        return res.status(200).send('OK');
-      }
-
-      // 2) 查訂單 → 代簽名轉發給外包（由外包使用 replyToken 回覆）
-      if (isOrderIntent(userText)) {
-        const fwd = await forwardToVendorWebhook(raw);
-        console.log('FORWARD_VENDOR', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
-        if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
-          await replyToLine(
-            replyToken,
-            '查詢系統暫時忙碌，請提供【訂單編號】或【訂購電話後四碼】，我先幫您人工查詢。',
-            { ...debugBase, route:'vendor-fallback' }
-          );
-        }
-        return res.status(200).send('OK');
-      }
-
-      // 3) 其他 → AI 回覆
-      const ans = await askOpenAI(userText);
-      await replyToLine(replyToken, ans, { ...debugBase, route:'ai' });
-      return res.status(200).send('OK');
     }
 
-    // 非文字訊息
-    if (ev?.type === 'message') {
-      await replyToLine(ev.replyToken, '目前僅支援文字訊息喔。', { route:'non-text' });
-    }
-
+    // 其他事件一律 200，避免重送
     return res.status(200).send('OK');
   } catch (e) {
     console.error('WEBHOOK_ERR', e?.message || e);
