@@ -2,12 +2,11 @@ export const config = { runtime: 'edge' };
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-
-const OPENAI_TIMEOUT_MS = 18000; // 最多等 18s
+const OPENAI_TIMEOUT_MS = 18000;
 const MAX_TOKENS = 256;
-const MAX_LINE = 4800;
+const MAX_LEN = 4800;
 
-function cut(t, n = MAX_LINE) { return t && t.length > n ? t.slice(0, n) : (t || ''); }
+function cut(t, n = MAX_LEN) { return t && t.length > n ? t.slice(0, n) : (t || ''); }
 
 async function askOpenAI({ system, prompt, model }) {
   const ctrl = new AbortController();
@@ -58,9 +57,10 @@ export default async function handler(req) {
   try {
     if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
-    // 簡單防護：內部呼叫才允許
-    const key = req.headers.get('X-Auth') || '';
+    // ✅ X-Auth 驗證（大小寫皆可）
+    const key = req.headers.get('X-Auth') || req.headers.get('x-auth') || '';
     if (!process.env.PUSH_SECRET || key !== process.env.PUSH_SECRET) {
+      // 不回真實原因，避免洩露
       return new Response('Unauthorized', { status: 401 });
     }
 
