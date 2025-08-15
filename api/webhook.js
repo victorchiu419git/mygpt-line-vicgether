@@ -1,7 +1,7 @@
-// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞 + 逾時保護
-// 需要（Production 環境變數）:
+// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞 + 非文字/低資訊處理 + 逾時保護
+// 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
-// 可選：OPENAI_MODEL, SYSTEM_PROMPT, FORWARD_FALLBACK_ON_ERROR=1, HUMAN_SNOOZE_MIN=15, SUPPORT_EMAIL
+// 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1
 
 // ---- 環境變數 ----
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
@@ -12,13 +12,13 @@ const VENDOR_URL   = (process.env.VENDOR_WEBHOOK || '').trim();
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  '你是「VicGether 亦啟科技 / POWAH」的 LINE 官方客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
+  '你是「VicGether Tech. 亦啟科技 / POWAH」的 LINE 官方ai客服助理。請用繁體中文、先給結論一句，再條列 2–4 點重點；不確定先釐清。';
 
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'service@vicgether.com';
-const FORWARD_FALLBACK_ON_ERROR = (process.env.FORWARD_FALLBACK_ON_ERROR || '') === '1';
 const SNOOZE_MIN = parseInt(process.env.HUMAN_SNOOZE_MIN || '15', 10);
+const FORWARD_FALLBACK_ON_ERROR = (process.env.FORWARD_FALLBACK_ON_ERROR || '') === '1';
 
-// ---- 參數與工具 ----
+// ---- 逾時與雜項 ----
 const MAX_LEN = 4800;
 const AI_TIMEOUT_MS     = 5000;  // 5s 取 AI
 const REPLY_TIMEOUT_MS  = 4000;  // 4s 回 LINE
@@ -27,7 +27,6 @@ const VENDOR_TIMEOUT_MS = 6000;  // 6s 轉發外包
 const snooze = new Map(); // 轉人工冷卻（若要跨實例，之後可換 Redis/KV）
 const cut = (t, n = MAX_LEN) => (t && t.length > n ? t.slice(0, n) : (t || ''));
 
-// 讀原始 POST body（Node）
 function readRaw(req) {
   return new Promise((resolve) => {
     try {
@@ -53,18 +52,17 @@ function isHumanIntent(t='') {
 function isHumanResumeIntent(t='') {
   return /(解除|取消|恢復).*(人工|機器|自動|AI)/i.test(t || '');
 }
-function isSnoozed(userId='') {
-  const until = snooze.get(userId) || 0;
-  return Date.now() < until;
+// 低資訊：移除空白/標點/符號後，剩下可判讀字元 < 2（英數或中日韓）
+function isLowInfoText(t='') {
+  const meaningful = (t.match(/[A-Za-z0-9\u4e00-\u9fff]/g) || []).length;
+  return meaningful < 2;
 }
 
 // ---- LINE Reply（單則）----
 async function replyToLine(replyToken, text, debug = {}) {
   if (!replyToken || !LINE_TOKEN) return;
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
-
   try {
     const r = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -83,10 +81,8 @@ async function replyToLine(replyToken, text, debug = {}) {
 // ---- LINE Reply（多則，含 quickReply 用）----
 async function replyMessages(replyToken, messages, debug = {}) {
   if (!replyToken || !LINE_TOKEN) return;
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
-
   try {
     const r = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -105,13 +101,11 @@ async function replyMessages(replyToken, messages, debug = {}) {
 // ---- 代簽並轉發到外包 Webhook（原封不動送過去）----
 async function forwardToVendorWebhook(rawBody) {
   if (!VENDOR_URL || !LINE_SECRET) return { ok:false, reason:'missing vendor or secret' };
-
   const { createHmac } = await import('crypto');
   const signature = createHmac('sha256', LINE_SECRET).update(rawBody).digest('base64');
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), VENDOR_TIMEOUT_MS);
-
   try {
     const r = await fetch(VENDOR_URL, {
       method: 'POST',
@@ -132,10 +126,8 @@ async function forwardToVendorWebhook(rawBody) {
 // ---- OpenAI（5s）----
 async function askOpenAI(userText) {
   if (!OPENAI_KEY) return '（AI 金鑰未設定，請稍後再試或轉人工）';
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), AI_TIMEOUT_MS);
-
   try {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -151,16 +143,13 @@ async function askOpenAI(userText) {
         ]
       })
     });
-
     if (r.status === 429) {
       let code=''; try { code=(await r.json())?.error?.code || ''; } catch {}
       return code==='insufficient_quota'
         ? '（AI 服務額度不足或未完成付款設定，請稍後再試或改由人工協助）'
         : '（目前請求較多，請稍候幾秒再試）';
     }
-
     if (!r.ok) return `（AI 服務暫時無法使用：${r.status}）`;
-
     const data = await r.json();
     return data?.choices?.[0]?.message?.content?.trim() || '（沒有產生可用回覆）';
   } catch (e) {
@@ -169,7 +158,7 @@ async function askOpenAI(userText) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- 入口處理 ----
+// ---- 入口 ----
 export default async function handler(req, res) {
   try {
     if (req.method !== 'POST') return res.status(200).send('OK');
@@ -220,11 +209,20 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
+        // 1.1) 低資訊文字：改走固定提示（避免讓 AI 回「結論｜重點」）
+        if (isLowInfoText(userText)) {
+          await replyToLine(
+            replyToken,
+            `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
+            { ...debugBase, route:'low-info' }
+          );
+          return res.status(200).send('OK');
+        }
+
         // 2) 查訂單：代簽名轉發給外包（由外包用 replyToken 回覆）
         if (isOrderIntent(userText)) {
           const fwd = await forwardToVendorWebhook(raw);
           console.log('FORWARD_VENDOR', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
-
           if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
             await replyToLine(
               replyToken,
@@ -232,7 +230,6 @@ export default async function handler(req, res) {
               { ...debugBase, route:'vendor-fallback' }
             );
           }
-          // 成功時由外包回覆；這裡不再多回
           return res.status(200).send('OK');
         }
 
@@ -242,7 +239,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
       }
 
-      // ---- 非文字訊息 ----
+      // ---- 非文字訊息（貼圖/圖片/語音/影片/位置/檔案等）----
       if (ev.type === 'message') {
         await replyToLine(
           ev.replyToken,
@@ -257,7 +254,7 @@ export default async function handler(req, res) {
         const msg1 = {
           type: 'text',
           text:
-`歡迎加入【VicGether｜POWAH】官方帳號！🎉
+`歡迎加入【亦啟科技｜VicGether Tech.｜POWAH】官方帳號！🎉
 這裡會不定期分享你不想錯過的【最新消息】與【小技巧】。
 想開始：
 - 查配送/進度 → 輸入【查訂單】（附【訂單編號】或【電話後四碼】更快）
@@ -282,7 +279,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 其他事件一律 200，避免重送
+    // 其他事件：一律 200，避免重送
     return res.status(200).send('OK');
   } catch (e) {
     console.error('WEBHOOK_ERR', e?.message || e);
