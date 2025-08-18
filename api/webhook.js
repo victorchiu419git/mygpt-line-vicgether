@@ -1,4 +1,4 @@
-// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞(新版) + 招呼分支 + 非文字/低資訊處理 + 逾時保護
+// api/webhook.js — AI 回覆 + 外包 Web Light 轉發 + 查訂單 + 轉人工冷卻 + 歡迎/招呼 + 非文字/低資訊 + 逾時保護
 // 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
 // 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1
@@ -51,6 +51,13 @@ function isHumanIntent(t='') {
 }
 function isHumanResumeIntent(t='') {
   return /(解除|取消|恢復).*(人工|機器|自動|AI)/i.test(t || '');
+}
+// Web Light 關鍵字：綁定會員/優惠券/紅利點數/產品/文章/LINE登入 等（不含「訂單」：訂單另有路由）
+function isVendorIntent(t='') {
+  if (!t) return false;
+  const hasOrder = isOrderIntent(t);
+  const vendorKW = /(綁定會員|綁定|會員|優惠券|折價券|紅利|點數|積分|產品|文章|關鍵字|登入|line ?登入)/i;
+  return vendorKW.test(t) && !hasOrder;
 }
 // 低資訊：移除空白/標點/符號後，剩下可判讀字元 < 2（英數或中日韓）
 function isLowInfoText(t='') {
@@ -239,7 +246,8 @@ export default async function handler(req, res) {
               items: [
                 { type: 'action', action: { type: 'message', label: '查訂單',   text: '查訂單' } },
                 { type: 'action', action: { type: 'message', label: '產品諮詢', text: '產品諮詢' } },
-                { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } }
+                { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } },
+                { type: 'action', action: { type: 'message', label: '綁定會員', text: '綁定會員' } }
               ]
             }
           };
@@ -257,16 +265,29 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 2) 查訂單：代簽名轉發給外包（由外包用 replyToken 回覆）
+        // 2) 訂單：代簽名轉發（由外包回覆）
         if (isOrderIntent(userText)) {
           const fwd = await forwardToVendorWebhook(raw);
-          console.log('FORWARD_VENDOR', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
-
+          console.log('FORWARD_VENDOR(order)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
           if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
             await replyToLine(
               replyToken,
               `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
-              { ...debugBase, route:'vendor-fallback' }
+              { ...debugBase, route:'vendor-fallback-order' }
+            );
+          }
+          return res.status(200).send('OK');
+        }
+
+        // 2.1) Web Light 其他關鍵字：綁定會員/優惠券/紅利點數/產品/文章/登入… → 也轉外包
+        if (isVendorIntent(userText)) {
+          const fwd = await forwardToVendorWebhook(raw);
+          console.log('FORWARD_VENDOR(vendorKW)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
+          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
+            await replyToLine(
+              replyToken,
+              `目前系統較忙，我先協助改走人工。\n您可直接輸入需求（例：「綁定會員」「查優惠券」「查紅利點數」），或寄至【${SUPPORT_EMAIL}】。`,
+              { ...debugBase, route:'vendor-fallback-kw' }
             );
           }
           return res.status(200).send('OK');
@@ -288,7 +309,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
       }
 
-      // ---- 加好友（follow）：歡迎詞 + Quick Reply（新版文案）----
+      // ---- 加好友（follow）：新版歡迎詞 + 4 顆 Quick Reply ----
       if (ev.type === 'follow') {
         const msg1 = {
           type: 'text',
@@ -299,6 +320,7 @@ export default async function handler(req, res) {
 - 查配送/進度 → 輸入【查訂單】（附【訂單編號】或【電話後四碼】更快）
 - 產品諮詢/安裝相容 → 輸入【產品諮詢】
 - 要真人協助 → 輸入【人工】
+- 綁定會員 → 輸入【綁定會員】（或點下方按鈕）
 需要附檔或詳述，也可寄至【${SUPPORT_EMAIL}】。
 請問還有什麼地方需要我幫忙的嗎？`
         };
@@ -309,7 +331,8 @@ export default async function handler(req, res) {
             items: [
               { type: 'action', action: { type: 'message', label: '查訂單',   text: '查訂單' } },
               { type: 'action', action: { type: 'message', label: '產品諮詢', text: '產品諮詢' } },
-              { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } }
+              { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } },
+              { type: 'action', action: { type: 'message', label: '綁定會員', text: '綁定會員' } }
             ]
           }
         };
