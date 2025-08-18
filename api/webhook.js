@@ -1,7 +1,8 @@
-// api/webhook.js — AI 回覆 + 外包 Web Light 轉發 + 訂單 + 轉人工冷卻 + 歡迎/招呼 + 非文字/低資訊 + 逾時保護
+// api/webhook.js — AI 回覆 + Web Light/訂單：先 ACK 再轉發外包 +（若有回應）push 回用戶
 // 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
-// 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1, VENDOR_KW_ACK=1
+// 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15,
+// FORWARD_FALLBACK_ON_ERROR=1, VENDOR_KW_ACK=1, VENDOR_ORDER_ACK=1
 
 // ---- 環境變數 ----
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
@@ -17,8 +18,8 @@ const SYSTEM_PROMPT =
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'service@vicgether.com';
 const SNOOZE_MIN = parseInt(process.env.HUMAN_SNOOZE_MIN || '15', 10);
 const FORWARD_FALLBACK_ON_ERROR = (process.env.FORWARD_FALLBACK_ON_ERROR || '') === '1';
-// ★ 新增：Web Light 關鍵字是否先行 ACK 再轉發（由外包改用 push 回覆）
-const VENDOR_KW_ACK = (process.env.VENDOR_KW_ACK || '') === '1';
+const VENDOR_KW_ACK = (process.env.VENDOR_KW_ACK || '1') === '1';      // Web Light 關鍵字預設先 ACK
+const VENDOR_ORDER_ACK = (process.env.VENDOR_ORDER_ACK || '1') === '1'; // 訂單查詢預設先 ACK
 
 // ---- 逾時與雜項 ----
 const MAX_LEN = 4800;
@@ -61,7 +62,7 @@ function isVendorIntent(t='') {
   const vendorKW = /(綁定會員|綁定|會員|優惠券|折價券|紅利|點數|積分|產品|文章|關鍵字|登入|line ?登入)/i;
   return vendorKW.test(t) && !hasOrder;
 }
-// 低資訊判斷
+// 低資訊
 function isLowInfoText(t='') {
   const meaningful = (t.match(/[A-Za-z0-9\u4e00-\u9fff]/g) || []).length;
   return meaningful < 2;
@@ -74,31 +75,14 @@ function isHelloIntent(t = '') {
   return /^[\s]*(hi|hello|hey|嗨|哈囉|哈啰|你好|午安|早安|晚安)[\s!！。,.～~]*$/i.test(t || '');
 }
 
-// ---- LINE Reply（單則）----
-async function replyToLine(replyToken, text, debug = {}) {
+// ---- LINE 回覆/推播 ----
+async function replyToLine(replyToken, textOrMsgs, debug = {}) {
   if (!replyToken || !LINE_TOKEN) return;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
-  try {
-    const r = await fetch('https://api.line.me/v2/bot/message/reply', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Authorization': `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: cut(text) }] })
-    });
-    const body = await r.text().catch(()=> '');
-    if (!r.ok) console.error('REPLY_FAIL', { status: r.status, body, debug });
-    else console.log('REPLY_OK', { status: r.status, debug });
-  } catch (e) {
-    console.error('REPLY_ERR', { error: e?.name || String(e), debug });
-  } finally { clearTimeout(timer); }
-}
-
-// ---- LINE Reply（多則）----
-async function replyMessages(replyToken, messages, debug = {}) {
-  if (!replyToken || !LINE_TOKEN) return;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
+  const messages = Array.isArray(textOrMsgs)
+    ? textOrMsgs
+    : [{ type: 'text', text: cut(textOrMsgs) }];
   try {
     const r = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -114,7 +98,33 @@ async function replyMessages(replyToken, messages, debug = {}) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- 代簽並轉發到外包 ----
+async function pushToLine(userId, textOrMsgs, debug = {}) {
+  if (!userId || !LINE_TOKEN) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), REPLY_TIMEOUT_MS);
+  const messages = Array.isArray(textOrMsgs)
+    ? textOrMsgs
+    : [{ type: 'text', text: cut(textOrMsgs) }];
+  try {
+    const r = await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Authorization': `Bearer ${LINE_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: userId, messages })
+    });
+    const body = await r.text().catch(()=> '');
+    if (!r.ok) console.error('PUSH_FAIL', { status: r.status, body, debug });
+    else console.log('PUSH_OK', { status: r.status, debug });
+  } catch (e) {
+    console.error('PUSH_ERR', { error: e?.name || String(e), debug });
+  } finally { clearTimeout(timer); }
+}
+
+async function replyMessages(replyToken, messages, debug = {}) {
+  return replyToLine(replyToken, messages, debug);
+}
+
+// ---- 轉外包（代簽）----
 async function forwardToVendorWebhook(rawBody) {
   if (!VENDOR_URL || !LINE_SECRET) return { ok:false, reason:'missing vendor or secret' };
   const { createHmac } = await import('crypto');
@@ -130,10 +140,33 @@ async function forwardToVendorWebhook(rawBody) {
       body: rawBody
     });
     const txt = await r.text().catch(()=> '');
-    return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 500) };
+    return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 4000) };
   } catch (e) {
     return { ok:false, reason: e?.name || String(e) };
   } finally { clearTimeout(timer); }
+}
+
+// ---- 嘗試解析外包 HTTP 回應，產生可送給 LINE 的 messages ----
+function parseVendorBody(body) {
+  if (!body) return null;
+  // 1) 嘗試 JSON
+  try {
+    const j = JSON.parse(body);
+    if (Array.isArray(j?.messages)) {
+      // 期待是 LINE messages 格式
+      return j.messages.slice(0, 5);
+    }
+    if (typeof j?.replyText === 'string' && j.replyText.trim()) {
+      return [{ type: 'text', text: j.replyText.trim().slice(0, MAX_LEN) }];
+    }
+    if (typeof j?.text === 'string' && j.text.trim()) {
+      return [{ type: 'text', text: j.text.trim().slice(0, MAX_LEN) }];
+    }
+  } catch {}
+  // 2) 純文字（移除粗淺 HTML）
+  const plain = String(body).replace(/<[^>]+>/g, '').trim();
+  if (plain) return [{ type: 'text', text: cut(plain) }];
+  return null;
 }
 
 // ---- OpenAI（5s）----
@@ -183,7 +216,14 @@ export default async function handler(req, res) {
     if (ev) {
       const mode = ev.mode || '(unknown)';
       const userId = ev.source?.userId || '(none)';
-      console.log('EVENT_MODE', { mode, userIdTail: userId.slice(-6), hasKey: !!OPENAI_KEY, hasLine: !!LINE_TOKEN, hasSecret: !!LINE_SECRET, hasVendor: !!VENDOR_URL });
+      console.log('EVENT_MODE', {
+        mode,
+        userIdTail: userId.slice(-6),
+        hasKey: !!OPENAI_KEY,
+        hasLine: !!LINE_TOKEN,
+        hasSecret: !!LINE_SECRET,
+        hasVendor: !!VENDOR_URL
+      });
 
       // ---- 文字訊息 ----
       if (ev.type === 'message' && ev.message?.type === 'text') {
@@ -194,7 +234,11 @@ export default async function handler(req, res) {
         // 0) 轉人工：設冷卻
         if (isHumanIntent(userText)) {
           snooze.set(userId, Date.now() + SNOOZE_MIN * 60 * 1000);
-          await replyToLine(replyToken, `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。\n您可以直接在此輸入問題；若需附檔，亦可寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`, { ...debugBase, route:'human-on' });
+          await replyToLine(
+            replyToken,
+            `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。\n您可以直接在此輸入問題；若需附檔，亦可寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
+            { ...debugBase, route:'human-on' }
+          );
           return res.status(200).send('OK');
         }
 
@@ -211,7 +255,7 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 1.0) 招呼
+        // 1.0) 招呼（不丟 AI）
         if (isHelloIntent(userText)) {
           const msg1 = {
             type: 'text',
@@ -241,21 +285,42 @@ export default async function handler(req, res) {
 
         // 1.1) 低資訊
         if (isLowInfoText(userText)) {
-          await replyToLine(replyToken, `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`, { ...debugBase, route:'low-info' });
+          await replyToLine(
+            replyToken,
+            `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
+            { ...debugBase, route:'low-info' }
+          );
           return res.status(200).send('OK');
         }
 
-        // 2) 訂單 → 外包 reply（舊邏輯）
+        // 2) 訂單：先 ACK（可開關）→ 轉外包 → 若外包有內容就 push 回用戶
         if (isOrderIntent(userText)) {
-          const fwd = await forwardToVendorWebhook(raw);
-          console.log('FORWARD_VENDOR(order)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
-          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
-            await replyToLine(replyToken, `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`, { ...debugBase, route:'vendor-fallback-order' });
+          if (VENDOR_ORDER_ACK) {
+            await replyToLine(
+              replyToken,
+              `已收到您的訂單查詢，我們正在為您處理。\n稍後會把結果傳送給您；若需人工請輸入【人工】。`,
+              { ...debugBase, route:'order-ack' }
+            );
+          }
+          const fwd = await forwardToVendorWebhook(JSON.stringify(body));
+          const parsed = fwd.ok ? parseVendorBody(fwd.body) : null;
+          console.log('FORWARD_VENDOR(order)', {
+            ok: fwd.ok, status: fwd.status || '-', bodyLen: (fwd.body || '').length || 0, ack: !!VENDOR_ORDER_ACK
+          });
+          if (parsed && parsed.length) {
+            await pushToLine(userId, parsed, { ...debugBase, route:'order-push' });
+          } else if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR && !VENDOR_ORDER_ACK) {
+            // 只有沒 ACK 才可能還能用 replyToken 回覆備援
+            await replyToLine(
+              replyToken,
+              `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
+              { ...debugBase, route:'vendor-fallback-order' }
+            );
           }
           return res.status(200).send('OK');
         }
 
-        // 2.1) Web Light 關鍵字 → （可選）先 ACK 再轉外包（讓外包用 push 回）
+        // 2.1) Web Light 關鍵字：先 ACK（可開關）→ 轉外包 → 若外包有內容就 push
         if (isVendorIntent(userText)) {
           if (VENDOR_KW_ACK) {
             await replyToLine(
@@ -263,11 +328,15 @@ export default async function handler(req, res) {
               `已收到您的需求，我們正在處理中。\n稍後會由系統發送最新進度給您；若需人工請輸入【人工】。`,
               { ...debugBase, route:'vendor-ack' }
             );
-            // 注意：replyToken 已被使用，外包請改用 Push API
           }
-          const fwd = await forwardToVendorWebhook(raw);
-          console.log('FORWARD_VENDOR(vendorKW)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-', ack: !!VENDOR_KW_ACK });
-          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR && !VENDOR_KW_ACK) {
+          const fwd = await forwardToVendorWebhook(JSON.stringify(body));
+          const parsed = fwd.ok ? parseVendorBody(fwd.body) : null;
+          console.log('FORWARD_VENDOR(vendorKW)', {
+            ok: fwd.ok, status: fwd.status || '-', bodyLen: (fwd.body || '').length || 0, ack: !!VENDOR_KW_ACK
+          });
+          if (parsed && parsed.length) {
+            await pushToLine(userId, parsed, { ...debugBase, route:'vendor-push' });
+          } else if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR && !VENDOR_KW_ACK) {
             await replyToLine(
               replyToken,
               `目前系統較忙，我先協助改走人工。\n您可直接輸入需求（例：「綁定會員」「查優惠券」「查紅利點數」），或寄至【${SUPPORT_EMAIL}】。`,
@@ -285,7 +354,11 @@ export default async function handler(req, res) {
 
       // ---- 非文字訊息 ----
       if (ev.type === 'message') {
-        await replyToLine(ev.replyToken, `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`, { route:'non-text', userIdTail: (ev.source?.userId || '').slice(-6) });
+        await replyToLine(
+          ev.replyToken,
+          `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
+          { route:'non-text', userIdTail: (ev.source?.userId || '').slice(-6) }
+        );
         return res.status(200).send('OK');
       }
 
