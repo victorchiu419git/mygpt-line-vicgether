@@ -1,0 +1,19 @@
+{
+  "name": "mygpt-line-vicgether",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "api/webhook.js",
+  "scripts": {
+    "start": "node api/webhook.js",
+    "start:company": "cross-env ENV_PROFILE=company node api/webhook.js",
+    "start:personal": "cross-env ENV_PROFILE=personal node api/webhook.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.0",
+    "axios": "^1.7.2",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "cross-env": "^7.0.3"
+  }
+}
