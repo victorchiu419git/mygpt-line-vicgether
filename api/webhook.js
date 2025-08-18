@@ -1,4 +1,4 @@
-// api/webhook.js — AI + Web Light/訂單：先 ACK → 轉外包；外包無回或太短→推播官網連結備援
+// api/webhook.js — AI + Web Light/訂單：先 ACK → 轉外包；外包無回或太短→（依旗標）AI or 推官網備援
 // 必填環境變數：OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
 // 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15,
 //       FORWARD_FALLBACK_ON_ERROR=1, VENDOR_KW_ACK=1, VENDOR_ORDER_ACK=1,
@@ -46,6 +46,11 @@ function readRaw(req) {
   });
 }
 
+// 新增：外包連線就緒檢查
+function vendorReady() {
+  return !!(VENDOR_URL && LINE_SECRET);
+}
+
 // ---- 意圖判斷 ----
 function isOrderIntent(text='') {
   const t = (text || '').trim(); if (!t) return false;
@@ -55,12 +60,15 @@ function isOrderIntent(text='') {
 }
 function isHumanIntent(t=''){ return /(人工|真人|客服|接線|人員協助|找人)/i.test(t||''); }
 function isHumanResumeIntent(t=''){ return /(解除|取消|恢復).*(人工|機器|自動|AI)/i.test(t||''); }
+
+// 調整：縮窄 vendor intent（僅會員/登入/優惠等明確網站任務；避免把一般問句丟外包）
 function isVendorIntent(t=''){ // Web Light 關鍵字（非訂單）
   if (!t) return false;
   const hasOrder = isOrderIntent(t);
-  const vendorKW = /(綁定會員|綁定|會員|優惠券|折價券|紅利|點數|積分|產品|文章|關鍵字|登入|line ?登入)/i;
+  const vendorKW = /(綁定會員|綁定|會員中心|會員|優惠券|折價券|紅利|點數|積分|登入|line ?登入|購物車|訂單查詢)/i;
   return vendorKW.test(t) && !hasOrder;
 }
+
 function isLowInfoText(t=''){ const m=(t.match(/[A-Za-z0-9\u4e00-\u9fff]/g)||[]).length; return m < 2; }
 function isSnoozed(userId=''){ const until = snooze.get(userId) || 0; return Date.now() < until; }
 function isHelloIntent(t=''){ return /^[\s]*(hi|hello|hey|嗨|哈囉|哈啰|你好|午安|早安|晚安)[\s!！。,.～~]*$/i.test(t||''); }
@@ -135,7 +143,7 @@ async function forwardToVendorWebhook(rawBody) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- 解析外包回應；太短則視為無效（走官網備援）----
+// ---- 解析外包回應；太短則視為無效（走備援或 AI）----
 function parseVendorBody(body) {
   if (!body) return null;
   // 1) JSON
@@ -282,7 +290,7 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 訂單：ACK → 轉外包（raw 以便驗簽）→ 有內容就 push；無內容/太短→推官網
+        // 訂單：ACK → 轉外包（raw 以便驗簽）→ 有內容就 push；無內容/太短→(依旗標)備援或AI
         if (isOrderIntent(userText)) {
           if (VENDOR_ORDER_ACK) {
             await replyToLine(
@@ -291,22 +299,44 @@ export default async function handler(req, res) {
               { ...debugBase, route:'order-ack' }
             );
           }
+
+          if (!vendorReady()) {
+            console.warn('VENDOR_NOT_READY(order)', { hasVendor: !!VENDOR_URL, hasSecret: !!LINE_SECRET });
+            if (FORWARD_FALLBACK_ON_ERROR) {
+              await pushToLine(
+                userId,
+                [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
+                { ...debugBase, route:'order-fallback-no-vendor' }
+              );
+            } else {
+              const ans = await askOpenAI(userText);
+              await pushToLine(userId, [{ type:'text', text: ans }], { ...debugBase, route:'order-ai-no-vendor' });
+            }
+            return res.status(200).send('OK');
+          }
+
           const fwd = await forwardToVendorWebhook(raw);
           const parsed = parseVendorBody(fwd.body);
           console.log('FORWARD_VENDOR(order)', { ok: fwd.ok, status: fwd.status || '-', bodyLen: (fwd.body || '').length || 0, ack: !!VENDOR_ORDER_ACK });
+
           if (parsed && parsed.length) {
             await pushToLine(userId, parsed, { ...debugBase, route:'order-push' });
           } else {
-            await pushToLine(
-              userId,
-              [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
-              { ...debugBase, route:'order-push-fallback' }
-            );
+            if (FORWARD_FALLBACK_ON_ERROR) {
+              await pushToLine(
+                userId,
+                [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
+                { ...debugBase, route:'order-push-fallback' }
+              );
+            } else {
+              const ans = await askOpenAI(userText);
+              await pushToLine(userId, [{ type:'text', text: ans }], { ...debugBase, route:'order-ai-fallback' });
+            }
           }
           return res.status(200).send('OK');
         }
 
-        // Web Light：ACK → 轉外包 → 有內容就 push；無內容/太短→推官網
+        // Web Light：ACK → 轉外包 → 有內容就 push；無內容/太短→(依旗標)備援或AI
         if (isVendorIntent(userText)) {
           if (VENDOR_KW_ACK) {
             await replyToLine(
@@ -315,17 +345,39 @@ export default async function handler(req, res) {
               { ...debugBase, route:'vendor-ack' }
             );
           }
+
+          if (!vendorReady()) {
+            console.warn('VENDOR_NOT_READY(vendorKW)', { hasVendor: !!VENDOR_URL, hasSecret: !!LINE_SECRET });
+            if (FORWARD_FALLBACK_ON_ERROR) {
+              await pushToLine(
+                userId,
+                [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
+                { ...debugBase, route:'vendor-fallback-no-vendor' }
+              );
+            } else {
+              const ans = await askOpenAI(userText);
+              await pushToLine(userId, [{ type:'text', text: ans }], { ...debugBase, route:'vendor-ai-no-vendor' });
+            }
+            return res.status(200).send('OK');
+          }
+
           const fwd = await forwardToVendorWebhook(raw);
           const parsed = parseVendorBody(fwd.body);
           console.log('FORWARD_VENDOR(vendorKW)', { ok: fwd.ok, status: fwd.status || '-', bodyLen: (fwd.body || '').length || 0, ack: !!VENDOR_KW_ACK });
+
           if (parsed && parsed.length) {
             await pushToLine(userId, parsed, { ...debugBase, route:'vendor-push' });
           } else {
-            await pushToLine(
-              userId,
-              [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
-              { ...debugBase, route:'vendor-push-fallback' }
-            );
+            if (FORWARD_FALLBACK_ON_ERROR) {
+              await pushToLine(
+                userId,
+                [{ type:'text', text:`尚未收到系統回覆，您可直接前往官網處理：\n${FALLBACK_URL}` }],
+                { ...debugBase, route:'vendor-push-fallback' }
+              );
+            } else {
+              const ans = await askOpenAI(userText);
+              await pushToLine(userId, [{ type:'text', text: ans }], { ...debugBase, route:'vendor-ai-fallback' });
+            }
           }
           return res.status(200).send('OK');
         }
