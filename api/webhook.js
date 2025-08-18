@@ -1,7 +1,7 @@
-// api/webhook.js — AI 回覆 + 外包 Web Light 轉發 + 查訂單 + 轉人工冷卻 + 歡迎/招呼 + 非文字/低資訊 + 逾時保護
+// api/webhook.js — AI 回覆 + 外包 Web Light 轉發 + 訂單 + 轉人工冷卻 + 歡迎/招呼 + 非文字/低資訊 + 逾時保護
 // 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
-// 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1
+// 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1, VENDOR_KW_ACK=1
 
 // ---- 環境變數 ----
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
@@ -17,14 +17,16 @@ const SYSTEM_PROMPT =
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'service@vicgether.com';
 const SNOOZE_MIN = parseInt(process.env.HUMAN_SNOOZE_MIN || '15', 10);
 const FORWARD_FALLBACK_ON_ERROR = (process.env.FORWARD_FALLBACK_ON_ERROR || '') === '1';
+// ★ 新增：Web Light 關鍵字是否先行 ACK 再轉發（由外包改用 push 回覆）
+const VENDOR_KW_ACK = (process.env.VENDOR_KW_ACK || '') === '1';
 
 // ---- 逾時與雜項 ----
 const MAX_LEN = 4800;
-const AI_TIMEOUT_MS     = 5000;  // 5s 取 AI
-const REPLY_TIMEOUT_MS  = 4000;  // 4s 回 LINE
-const VENDOR_TIMEOUT_MS = 6000;  // 6s 轉發外包
+const AI_TIMEOUT_MS     = 5000;
+const REPLY_TIMEOUT_MS  = 4000;
+const VENDOR_TIMEOUT_MS = 6000;
 
-const snooze = new Map(); // 轉人工冷卻（若要跨實例，之後可換 Redis/KV）
+const snooze = new Map();
 const cut = (t, n = MAX_LEN) => (t && t.length > n ? t.slice(0, n) : (t || ''));
 
 function readRaw(req) {
@@ -52,24 +54,22 @@ function isHumanIntent(t='') {
 function isHumanResumeIntent(t='') {
   return /(解除|取消|恢復).*(人工|機器|自動|AI)/i.test(t || '');
 }
-// Web Light 關鍵字：綁定會員/優惠券/紅利點數/產品/文章/LINE登入 等（不含「訂單」：訂單另有路由）
+// Web Light 關鍵字（非訂單）
 function isVendorIntent(t='') {
   if (!t) return false;
   const hasOrder = isOrderIntent(t);
   const vendorKW = /(綁定會員|綁定|會員|優惠券|折價券|紅利|點數|積分|產品|文章|關鍵字|登入|line ?登入)/i;
   return vendorKW.test(t) && !hasOrder;
 }
-// 低資訊：移除空白/標點/符號後，剩下可判讀字元 < 2（英數或中日韓）
+// 低資訊判斷
 function isLowInfoText(t='') {
   const meaningful = (t.match(/[A-Za-z0-9\u4e00-\u9fff]/g) || []).length;
   return meaningful < 2;
 }
-// 是否在轉人工冷卻期間
 function isSnoozed(userId='') {
   const until = snooze.get(userId) || 0;
   return Date.now() < until;
 }
-// 純打招呼意圖（Hi/Hello/嗨/你好…）
 function isHelloIntent(t = '') {
   return /^[\s]*(hi|hello|hey|嗨|哈囉|哈啰|你好|午安|早安|晚安)[\s!！。,.～~]*$/i.test(t || '');
 }
@@ -94,7 +94,7 @@ async function replyToLine(replyToken, text, debug = {}) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- LINE Reply（多則，含 quickReply 用）----
+// ---- LINE Reply（多則）----
 async function replyMessages(replyToken, messages, debug = {}) {
   if (!replyToken || !LINE_TOKEN) return;
   const controller = new AbortController();
@@ -114,7 +114,7 @@ async function replyMessages(replyToken, messages, debug = {}) {
   } finally { clearTimeout(timer); }
 }
 
-// ---- 代簽並轉發到外包 Webhook（原封不動送過去）----
+// ---- 代簽並轉發到外包 ----
 async function forwardToVendorWebhook(rawBody) {
   if (!VENDOR_URL || !LINE_SECRET) return { ok:false, reason:'missing vendor or secret' };
   const { createHmac } = await import('crypto');
@@ -126,19 +126,14 @@ async function forwardToVendorWebhook(rawBody) {
     const r = await fetch(VENDOR_URL, {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Line-Signature': signature
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Line-Signature': signature },
       body: rawBody
     });
     const txt = await r.text().catch(()=> '');
     return { ok: r.ok, status: r.status, body: (txt || '').slice(0, 500) };
   } catch (e) {
     return { ok:false, reason: e?.name || String(e) };
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
 // ---- OpenAI（5s）----
@@ -188,14 +183,7 @@ export default async function handler(req, res) {
     if (ev) {
       const mode = ev.mode || '(unknown)';
       const userId = ev.source?.userId || '(none)';
-      console.log('EVENT_MODE', {
-        mode,
-        userIdTail: userId.slice(-6),
-        hasKey: !!OPENAI_KEY,
-        hasLine: !!LINE_TOKEN,
-        hasSecret: !!LINE_SECRET,
-        hasVendor: !!VENDOR_URL
-      });
+      console.log('EVENT_MODE', { mode, userIdTail: userId.slice(-6), hasKey: !!OPENAI_KEY, hasLine: !!LINE_TOKEN, hasSecret: !!LINE_SECRET, hasVendor: !!VENDOR_URL });
 
       // ---- 文字訊息 ----
       if (ev.type === 'message' && ev.message?.type === 'text') {
@@ -206,28 +194,24 @@ export default async function handler(req, res) {
         // 0) 轉人工：設冷卻
         if (isHumanIntent(userText)) {
           snooze.set(userId, Date.now() + SNOOZE_MIN * 60 * 1000);
-          await replyToLine(
-            replyToken,
-            `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。\n您可以直接在此輸入問題；若需附檔，亦可寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
-            { ...debugBase, route:'human-on' }
-          );
+          await replyToLine(replyToken, `已為您轉接人工服務（約【${SNOOZE_MIN} 分鐘】有效）。\n您可以直接在此輸入問題；若需附檔，亦可寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`, { ...debugBase, route:'human-on' });
           return res.status(200).send('OK');
         }
 
-        // 0.1) 解除人工：清冷卻
+        // 0.1) 解除人工
         if (isHumanResumeIntent(userText)) {
           snooze.delete(userId);
           await replyToLine(replyToken, '已結束人工模式，恢復機器回覆。', { ...debugBase, route:'human-off' });
           return res.status(200).send('OK');
         }
 
-        // 1) 冷卻期間：不回覆（留給業務）
+        // 1) 冷卻期間
         if (isSnoozed(userId)) {
           console.log('HUMAN_SNOOZED', debugBase);
           return res.status(200).send('OK');
         }
 
-        // 1.0) 純打招呼：回友善歡迎＋ Quick Reply（不丟給 AI）
+        // 1.0) 招呼
         if (isHelloIntent(userText)) {
           const msg1 = {
             type: 'text',
@@ -255,35 +239,35 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 1.1) 低資訊文字：固定提示
+        // 1.1) 低資訊
         if (isLowInfoText(userText)) {
-          await replyToLine(
-            replyToken,
-            `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
-            { ...debugBase, route:'low-info' }
-          );
+          await replyToLine(replyToken, `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`, { ...debugBase, route:'low-info' });
           return res.status(200).send('OK');
         }
 
-        // 2) 訂單：代簽名轉發（由外包回覆）
+        // 2) 訂單 → 外包 reply（舊邏輯）
         if (isOrderIntent(userText)) {
           const fwd = await forwardToVendorWebhook(raw);
           console.log('FORWARD_VENDOR(order)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
           if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
-            await replyToLine(
-              replyToken,
-              `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`,
-              { ...debugBase, route:'vendor-fallback-order' }
-            );
+            await replyToLine(replyToken, `查詢系統暫時忙碌，我先協助改走人工。\n請提供【訂單編號】或【訂購電話後四碼】，或將資訊寄至【${SUPPORT_EMAIL}】（請註明 LINE 暱稱＋問題摘要）。`, { ...debugBase, route:'vendor-fallback-order' });
           }
           return res.status(200).send('OK');
         }
 
-        // 2.1) Web Light 其他關鍵字：綁定會員/優惠券/紅利點數/產品/文章/登入… → 也轉外包
+        // 2.1) Web Light 關鍵字 → （可選）先 ACK 再轉外包（讓外包用 push 回）
         if (isVendorIntent(userText)) {
+          if (VENDOR_KW_ACK) {
+            await replyToLine(
+              replyToken,
+              `已收到您的需求，我們正在處理中。\n稍後會由系統發送最新進度給您；若需人工請輸入【人工】。`,
+              { ...debugBase, route:'vendor-ack' }
+            );
+            // 注意：replyToken 已被使用，外包請改用 Push API
+          }
           const fwd = await forwardToVendorWebhook(raw);
-          console.log('FORWARD_VENDOR(vendorKW)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-' });
-          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR) {
+          console.log('FORWARD_VENDOR(vendorKW)', { ok: fwd.ok, status: fwd.status || '-', reason: fwd.reason || '-', ack: !!VENDOR_KW_ACK });
+          if (!fwd.ok && FORWARD_FALLBACK_ON_ERROR && !VENDOR_KW_ACK) {
             await replyToLine(
               replyToken,
               `目前系統較忙，我先協助改走人工。\n您可直接輸入需求（例：「綁定會員」「查優惠券」「查紅利點數」），或寄至【${SUPPORT_EMAIL}】。`,
@@ -293,23 +277,19 @@ export default async function handler(req, res) {
           return res.status(200).send('OK');
         }
 
-        // 3) 其他：AI 回覆
+        // 3) 其他 → AI
         const ans = await askOpenAI(userText);
         await replyToLine(replyToken, ans, { ...debugBase, route:'ai' });
         return res.status(200).send('OK');
       }
 
-      // ---- 非文字訊息（貼圖/圖片/語音/影片/位置/檔案等）----
+      // ---- 非文字訊息 ----
       if (ev.type === 'message') {
-        await replyToLine(
-          ev.replyToken,
-          `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`,
-          { route:'non-text', userIdTail: (ev.source?.userId || '').slice(-6) }
-        );
+        await replyToLine(ev.replyToken, `目前僅支援文字訊息喔。\n請以文字描述需求（例：「保固申請」「安裝教學」「查訂單 12345」）；若需附檔，亦可寄至【${SUPPORT_EMAIL}】。`, { route:'non-text', userIdTail: (ev.source?.userId || '').slice(-6) });
         return res.status(200).send('OK');
       }
 
-      // ---- 加好友（follow）：新版歡迎詞 + 4 顆 Quick Reply ----
+      // ---- 加好友（follow）----
       if (ev.type === 'follow') {
         const msg1 = {
           type: 'text',
@@ -341,7 +321,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // 其他事件：一律 200，避免重送
     return res.status(200).send('OK');
   } catch (e) {
     console.error('WEBHOOK_ERR', e?.message || e);
