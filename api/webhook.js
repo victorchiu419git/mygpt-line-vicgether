@@ -1,4 +1,4 @@
-// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞(新版) + 非文字/低資訊處理 + 逾時保護
+// api/webhook.js — 總控路由 + 轉人工冷卻 + 歡迎詞(新版) + 招呼分支 + 非文字/低資訊處理 + 逾時保護
 // 必填（Production 環境變數）:
 // OPENAI_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, VENDOR_WEBHOOK
 // 選填：OPENAI_MODEL, SYSTEM_PROMPT, SUPPORT_EMAIL, HUMAN_SNOOZE_MIN=15, FORWARD_FALLBACK_ON_ERROR=1
@@ -61,6 +61,10 @@ function isLowInfoText(t='') {
 function isSnoozed(userId='') {
   const until = snooze.get(userId) || 0;
   return Date.now() < until;
+}
+// 純打招呼意圖（Hi/Hello/嗨/你好…）
+function isHelloIntent(t = '') {
+  return /^[\s]*(hi|hello|hey|嗨|哈囉|哈啰|你好|午安|早安|晚安)[\s!！。,.～~]*$/i.test(t || '');
 }
 
 // ---- LINE Reply（單則）----
@@ -213,6 +217,33 @@ export default async function handler(req, res) {
         // 1) 冷卻期間：不回覆（留給業務）
         if (isSnoozed(userId)) {
           console.log('HUMAN_SNOOZED', debugBase);
+          return res.status(200).send('OK');
+        }
+
+        // 1.0) 純打招呼：回友善歡迎＋ Quick Reply（不丟給 AI）
+        if (isHelloIntent(userText)) {
+          const msg1 = {
+            type: 'text',
+            text:
+`嗨～我是【亦啟科技｜VicGether Tech.｜POWAH】AI 助理。
+想開始：
+- 查配送/進度 → 回覆【查訂單】（附【訂單編號】或【電話後四碼】更快）
+- 產品諮詢/安裝相容 → 回覆【產品諮詢】
+- 需要真人 → 回覆【我要人工】
+也可寄至【${SUPPORT_EMAIL}】。`
+          };
+          const msg2 = {
+            type: 'text',
+            text: '可以用下方快速按鈕開始：',
+            quickReply: {
+              items: [
+                { type: 'action', action: { type: 'message', label: '查訂單',   text: '查訂單' } },
+                { type: 'action', action: { type: 'message', label: '產品諮詢', text: '產品諮詢' } },
+                { type: 'action', action: { type: 'message', label: '我要人工', text: '我要人工' } }
+              ]
+            }
+          };
+          await replyMessages(replyToken, [msg1, msg2], { ...debugBase, route: 'hello' });
           return res.status(200).send('OK');
         }
 
